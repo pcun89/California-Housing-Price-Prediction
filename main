@@ -37,3 +37,183 @@ RANDOM_STATE = 42
 OUTPUT_ARTIFACT = "regressor_artifact.joblib"
 # number of sampled hyperparameter settings (tradeoff speed vs thoroughness)
 SEARCH_ITER = 25
+
+
+def loadDataset() -> Tuple[pd.DataFrame, pd.Series]:
+    """
+    Load the California Housing dataset and return features DataFrame and target Series.
+    """
+    raw = fetch_california_housing(as_frame=True)
+    X_df = raw.frame.drop(
+        columns=["MedHouseVal"]) if "MedHouseVal" in raw.frame.columns else raw.data
+    y_series = raw.target if hasattr(
+        raw, "target") else raw.frame["MedHouseVal"]
+    # When as_frame=True, `raw.frame` contains combined X + y (sklearn versions vary). Adjust safely above.
+    return X_df, y_series
+
+
+def createStratifiedBins(y: pd.Series, nBins: int = 10) -> np.ndarray:
+    """
+    Create binned labels for stratified splitting. For regression tasks,
+    stratified splitting by binned target preserves the target distribution.
+    """
+    # Use quantile-based bins to create balanced bins
+    bins = np.quantile(y, q=np.linspace(0, 1, nBins + 1))
+    # np.digitize returns 1..nBins, subtract 1 to make 0..nBins-1
+    binned = np.digitize(y, bins[1:-1], right=True)
+    return binned
+
+
+def splitData(
+    X_df: pd.DataFrame, y_series: pd.Series, testSize: float = 0.2
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str]]:
+    """
+    Stratified train/test split (on binned target) and return arrays + feature names.
+    """
+    featureNames = list(X_df.columns)
+    binnedY = createStratifiedBins(y_series, nBins=10)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_df.values,
+        y_series.values,
+        test_size=testSize,
+        random_state=RANDOM_STATE,
+        stratify=binnedY,
+    )
+    return X_train, X_test, y_train, y_test, featureNames
+
+
+def buildPipeline(useScaler: bool = True) -> Pipeline:
+    """
+    Build a sklearn Pipeline with optional scaling and the regressor.
+    HistGradientBoostingRegressor is fast and handles missing values internally.
+    """
+    steps = []
+    if useScaler:
+        # RobustScaler is robust to outliers and often helps tree-based models little,
+        # but kept here for possible linear-model swaps later.
+        steps.append(("scaler", RobustScaler()))
+    # Use HistGradientBoostingRegressor for speed on medium-sized tabular data
+    hgb = HistGradientBoostingRegressor(random_state=RANDOM_STATE)
+    steps.append(("regressor", hgb))
+    pipeline = Pipeline(steps)
+    return pipeline
+
+
+def getSearchSpace() -> Dict[str, Any]:
+    """
+    Define randomized search distributions for Hyperparameters of HistGradientBoostingRegressor.
+    """
+    paramDist = {
+        # number of boosting iterations
+        "regressor__max_iter": randint(50, 500),
+        "regressor__max_depth": randint(3, 20),            # tree depth
+        "regressor__learning_rate": uniform(0.01, 0.3),    # learning rate
+        # controls tree complexity
+        "regressor__max_leaf_nodes": randint(10, 200),
+        "regressor__min_samples_leaf": randint(1, 50),     # leaf size
+        "regressor__l2_regularization": uniform(0.0, 1.0),  # L2 regularization
+    }
+    return paramDist
+
+
+def tuneModel(
+    pipeline: Pipeline,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    nIter: int = SEARCH_ITER,
+    cvFolds: int = 5,
+) -> RandomizedSearchCV:
+    """
+    Use RandomizedSearchCV with StratifiedKFold (on binned target) to find strong hyperparams.
+    Returns the fitted RandomizedSearchCV object.
+    """
+    paramDist = getSearchSpace()
+    # StratifiedKFold on binned target to keep distribution in folds
+    binned = createStratifiedBins(pd.Series(y_train), nBins=5)
+    skf = StratifiedKFold(n_splits=cvFolds, shuffle=True,
+                          random_state=RANDOM_STATE)
+
+    rndSearch = RandomizedSearchCV(
+        estimator=pipeline,
+        param_distributions=paramDist,
+        n_iter=nIter,
+        # negative RMSE (sklearn expects a score; higher is better)
+        scoring="neg_root_mean_squared_error",
+        cv=skf,
+        n_jobs=-1,
+        verbose=1,
+        random_state=RANDOM_STATE,
+        return_train_score=False,
+    )
+
+    rndSearch.fit(X_train, y_train)
+    return rndSearch
+
+
+def evaluateModel(model: Any, X_test: np.ndarray, y_test: np.ndarray, featureNames: Optional[list[str]] = None) -> None:
+    """
+    Evaluate model on test set; print RMSE and R^2.
+    """
+    yPred = model.predict(X_test)
+    rmse = mean_squared_error(y_test, yPred, squared=False)  # root MSE
+    r2 = r2_score(y_test, yPred)
+    print("=== Test set performance ===")
+    print(f"RMSE : {rmse:.4f}")
+    print(f"R^2 : {r2:.4f}")
+
+    # If regressor supports feature_importances_, print top features
+    try:
+        if hasattr(model, "named_steps") and "regressor" in model.named_steps:
+            reg = model.named_steps["regressor"]
+            if hasattr(reg, "feature_importances_"):
+                importances = reg.feature_importances_
+                idx = np.argsort(importances)[::-1]
+                topN = min(10, len(featureNames or []))
+                print("\nTop feature importances (first 10):")
+                for i in range(topN):
+                    name = (featureNames or [str(j)
+                            for j in range(len(importances))])[idx[i]]
+                    print(f"{i+1:2d}. {name:30s} -> {importances[idx[i]]:.4f}")
+    except Exception:
+        # Non-critical: skip if not available
+        pass
+
+
+def saveArtifact(model: Any, featureNames: list[str], outPath: str = OUTPUT_ARTIFACT) -> None:
+    """
+    Save trained pipeline and metadata to disk (joblib).
+    """
+    metadata = {"feature_names": featureNames, "random_state": RANDOM_STATE}
+    artifact = {"pipeline": model, "metadata": metadata}
+    joblib.dump(artifact, outPath)
+    print(f"Saved artifact to: {outPath}")
+
+
+def main() -> None:
+    """
+    Main program flow: load data, split, build pipeline, tune, evaluate, save.
+    """
+    print("Loading dataset...")
+    X_df, y_series = loadDataset()
+    X_train, X_test, y_train, y_test, featureNames = splitData(
+        X_df, y_series, testSize=0.2)
+
+    print("Building pipeline (scaler + HistGradientBoostingRegressor)...")
+    pipeline = buildPipeline(useScaler=True)
+
+    print("Tuning hyperparameters with RandomizedSearchCV (this will use all CPU cores)...")
+    rndSearch = tuneModel(pipeline, X_train, y_train,
+                          nIter=SEARCH_ITER, cvFolds=5)
+    bestPipeline = rndSearch.best_estimator_
+    print(f"Best params: {rndSearch.best_params_}")
+    print(f"Best CV score (neg RMSE): {rndSearch.best_score_:.4f}")
+
+    print("\nEvaluating on held-out test set...")
+    evaluateModel(bestPipeline, X_test, y_test, featureNames=featureNames)
+
+    print("\nSaving artifact...")
+    saveArtifact(bestPipeline, featureNames, outPath=OUTPUT_ARTIFACT)
+
+
+if __name__ == "__main__":
+    main()
