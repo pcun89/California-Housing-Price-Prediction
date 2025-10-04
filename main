@@ -1,0 +1,21 @@
+"""
+main_regression.py
+
+California Housing price prediction pipeline.
+
+Style:
+- camelCase for variables and functions
+- docstrings for functions
+- main() entrypoint
+- inline comments explaining steps
+
+Usage:
+    python main_regression.py
+"""
+from __future__ import annotations
+import os
+import json
+from typing import Tuple, Any, Dict, Optional
+
+import numpy as np
+import pandas as pd
