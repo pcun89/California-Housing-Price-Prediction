@@ -19,3 +19,21 @@ from typing import Tuple, Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
+from sklearn.datasets import fetch_california_housing
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.model_selection import (
+    train_test_split,
+    RandomizedSearchCV,
+    StratifiedKFold,
+)
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import RobustScaler
+from sklearn.metrics import mean_squared_error, r2_score
+from scipy.stats import randint, uniform
+import joblib
+
+# constants
+RANDOM_STATE = 42
+OUTPUT_ARTIFACT = "regressor_artifact.joblib"
+# number of sampled hyperparameter settings (tradeoff speed vs thoroughness)
+SEARCH_ITER = 25
